@@ -26,6 +26,18 @@ namespace taotu {
  */
 class TimePoint {
  public:
+  class NowCacheGuard {
+   public:
+    explicit NowCacheGuard(int64_t now_microseconds);
+    ~NowCacheGuard();
+
+    void Update(int64_t now_microseconds);
+
+   private:
+    bool old_enabled_;
+    int64_t old_now_microseconds_;
+  };
+
   // Current time point
   TimePoint();
 
@@ -60,8 +72,14 @@ class TimePoint {
 
   // Get current time point
   static int64_t FNow();
+  // Get current time point without thread-local cache.
+  static int64_t FNowRaw();
+  // Construct one time point directly from absolute microseconds.
+  static TimePoint FromMicroseconds(int64_t absolute_microseconds);
 
  private:
+  explicit TimePoint(int64_t absolute_microseconds, int);
+
   // The time point in microsecond saved
   int64_t time_point_microseconds_;
 

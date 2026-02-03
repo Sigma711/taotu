@@ -31,6 +31,8 @@ class Poller;
  *
  */
 class Eventer : NonCopyableMovable {
+  friend class Poller;
+
  public:
   typedef std::function<void()> NormalCallback;
   typedef std::function<void(TimePoint)> ReadCallback;
@@ -111,6 +113,11 @@ class Eventer : NonCopyableMovable {
   uint32_t out_events_;
 
   bool is_handling_;
+
+  // Poll state stored directly on Eventer to avoid Poller-side hash lookup.
+  uint32_t poll_mask_{0};
+  bool poll_armed_{false};
+  uint64_t poll_token_{0};
 
   // Callback function which will be called after each reading
   ReadCallback ReadCallback_;

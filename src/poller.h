@@ -18,7 +18,6 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
-#include <unordered_map>
 #include <vector>
 
 #include "non_copyable_movable.h"
@@ -44,13 +43,14 @@ class Poller : NonCopyableMovable {
   typedef void (*ContextDeleter)(void* context);
 
   struct IoUringOp {
+    enum class State { kInit, kInflight, kCanceled, kDone };
     OpType type{OpType::kNone};
     Eventer* eventer{nullptr};
     void* context{nullptr};
     int fd{-1};
     CompletionFn completion{nullptr};
-    uint64_t key{0};
     ContextDeleter context_deleter{nullptr};
+    std::atomic<State> state{State::kInit};
   };
 
   Poller();
@@ -100,14 +100,8 @@ class Poller : NonCopyableMovable {
   static constexpr size_t kBufCount = 64;
 
  private:
-  struct EventerState {
-    uint32_t mask{0};   // Event mask of interest (POLLIN/POLLOUT).
-    bool armed{false};  // Whether a poll request is already pending.
-    uint64_t poll_key{0};
-  };
-
-  uint64_t NormalizeKey(uint64_t key);
-  std::unique_ptr<IoUringOp> LookupOp(uint64_t key);
+  static uint64_t EncodeOp(IoUringOp* op);
+  static IoUringOp* DecodeOp(uint64_t token);
   void CleanupOpContext(IoUringOp* op);
 
   void SubmitPoll(Eventer* eventer);
@@ -119,10 +113,6 @@ class Poller : NonCopyableMovable {
   void ReleaseBufferFromCqe(struct io_uring_cqe* cqe);
 
   struct io_uring ring_;
-  std::unordered_map<Eventer*, EventerState> states_;
-  std::unordered_map<uint64_t, std::unique_ptr<IoUringOp>> ops_;
-  std::atomic_uint64_t next_key_{1};
-  mutable MutexLock ops_mutex_;
   bool use_sqpoll_{false};
   bool use_multishot_accept_{true};
   bool buffers_registered_{false};

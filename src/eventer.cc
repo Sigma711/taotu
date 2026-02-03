@@ -26,7 +26,10 @@ Eventer::Eventer(Poller* poller, int fd)
       fd_(fd),
       in_events_(0x0000),
       out_events_(0x0000),
-      is_handling_(false) {
+      is_handling_(false),
+      poll_mask_(0),
+      poll_armed_(false),
+      poll_token_(0) {
   poller_->AddEventer(this);
 }
 Eventer::~Eventer() {

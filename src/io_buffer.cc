@@ -24,6 +24,18 @@ namespace taotu {
 
 namespace {
 constexpr char kCrlf[] = "\r\n";
+constexpr size_t kBufferGrowChunk = 64 * 1024;
+
+size_t AlignUp(size_t value, size_t align) {
+  if (align == 0) {
+    return value;
+  }
+  size_t rem = value % align;
+  if (rem == 0) {
+    return value;
+  }
+  return value + (align - rem);
+}
 }  // namespace
 
 IoBuffer::IoBuffer(size_t initial_capacity)
@@ -341,19 +353,21 @@ ssize_t IoBuffer::WriteToFd(int fd) {
 }
 
 void IoBuffer::ReserveWritableSpace(size_t len) {
-  if (GetWritableBytes() + GetReservedBytes() - kReservedCapacity < len) {
-    buffer_.resize(writing_index_ + len);
-  } else {
-    // Move forward to-read contents if too much space are reserved in the
-    // front of the buffer, and then the writable space will be enough without
-    // dilatation
-    ::memmove(static_cast<void*>(
-                  const_cast<char*>(GetBufferBegin() + kReservedCapacity)),
-              static_cast<const void*>(GetBufferBegin() + reading_index_),
-              GetReadableBytes());
-    reading_index_ = kReservedCapacity;
-    writing_index_ = reading_index_ + GetReadableBytes();
+  // Grow in fixed-size chunks and avoid memmove in hot paths.
+  // This keeps the implementation simple and removes large data relocation.
+  if (GetWritableBytes() >= len) {
+    return;
   }
+  const size_t required = writing_index_ + len;
+  const size_t chunked_required = AlignUp(required, kBufferGrowChunk);
+  size_t next_size = buffer_.size();
+  if (next_size == 0) {
+    next_size = kReservedCapacity + kInitialCapacity;
+  }
+  while (next_size < chunked_required) {
+    next_size = AlignUp(next_size * 2, kBufferGrowChunk);
+  }
+  buffer_.resize(next_size);
 }
 
 }  // namespace taotu

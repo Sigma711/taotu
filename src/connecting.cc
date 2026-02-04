@@ -445,8 +445,44 @@ void Connecting::Send(const std::string& message) {
   Send(static_cast<const void*>(message.c_str()), message.size());
 }
 void Connecting::Send(IoBuffer* io_buffer) {
-  Send(io_buffer->GetReadablePosition(), io_buffer->GetReadableBytes());
+  if (io_buffer == nullptr) {
+    return;
+  }
+  size_t msg_len = io_buffer->GetReadableBytes();
+  if (msg_len == 0) {
+    return;
+  }
+  if (ConnectionState::kDisconnected == state_.load()) {
+    LOG_ERROR("Fd(%d) is disconnected, so give up sending the message!!!",
+              Fd());
+    return;
+  }
+  if (ConnectionState::kConnected != state_.load()) {
+    return;
+  }
+  size_t queued_len = output_buffer_.GetReadableBytes() +
+                      pending_output_buffer_.GetReadableBytes();
+  if (HighWaterMarkCallback_ && queued_len + msg_len >= high_water_mark_ &&
+      queued_len < high_water_mark_) {
+    HighWaterMarkCallback_(*this, queued_len + msg_len);
+  }
+  if (write_in_flight_) {
+    if (pending_output_buffer_.GetReadableBytes() == 0) {
+      pending_output_buffer_.Swap(*io_buffer);
+    } else {
+      pending_output_buffer_.Append(io_buffer->GetReadablePosition(), msg_len);
+      io_buffer->RefreshRW();
+    }
+    return;
+  }
+  if (output_buffer_.GetReadableBytes() == 0) {
+    output_buffer_.Swap(*io_buffer);
+    SubmitWriteOnce();
+    return;
+  }
+  output_buffer_.Append(io_buffer->GetReadablePosition(), msg_len);
   io_buffer->RefreshRW();
+  SubmitWriteOnce();
 }
 
 void Connecting::ShutDownWrite() {

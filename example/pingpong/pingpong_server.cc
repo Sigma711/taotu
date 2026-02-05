@@ -41,6 +41,9 @@ void PingpongServer::Start() { server_->Start(); }
 void PingpongServer::OnConnectionCallback(taotu::Connecting& connection) {
   if (connection.IsConnected()) {
     connection.SetTcpNoDelay(true);
+    connection.RegisterOnBorrowedMessageCallback(
+        [](taotu::Connecting& conn, const char*, size_t len, uint16_t buf_id,
+           taotu::TimePoint) { return conn.SendBorrowed(buf_id, len); });
   }
 }
 void PingpongServer::OnMessageCallback(taotu::Connecting& connection,

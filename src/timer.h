@@ -12,9 +12,9 @@
 #ifndef TAOTU_SRC_TIMER_H_
 #define TAOTU_SRC_TIMER_H_
 
+#include <atomic>
 #include <functional>
 #include <map>
-#include <atomic>
 #include <vector>
 
 #include "non_copyable_movable.h"

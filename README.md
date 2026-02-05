@@ -59,6 +59,12 @@ These are read at process startup by `Poller`:
   - Default: `65536`
   - Max clamp: `1048576`
   - Effect: max cached io_uring operation objects per `Poller` for allocation reuse.
+- `TAOTU_IORING_BORROWED_BUFFER_LIMIT`
+  - Default: `kBufCount/2` (currently `128`)
+  - Clamp range: `[0, kBufCount]`
+  - Effect: max number of recv-multishot provided buffers that can be leased
+    (held past the read CQE) for the borrowed-send fast path; `0` disables
+    leasing (borrowed send falls back to copy).
 
 Example:
 

@@ -59,6 +59,12 @@ cmake --build build_release -j
   - 默认值：`65536`
   - 最大限制：`1048576`
   - 作用：每个 `Poller` 可缓存复用的 io_uring 操作对象上限。
+- `TAOTU_IORING_BORROWED_BUFFER_LIMIT`
+  - 默认值：`kBufCount/2`（当前为 `128`）
+  - 限制范围：`[0, kBufCount]`
+  - 作用：recv-multishot 的 provided-buffer 最多允许被“借用/持有”的数量上限
+    （读取 CQE 回调结束后暂不归还，用于借用直发）；设为 `0` 可禁用借用
+    （借用发送会自动回退为拷贝发送）。
 
 示例：
 

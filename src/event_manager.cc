@@ -255,6 +255,9 @@ void EventManager::DoWithActiveTasks(const TimePoint& return_time) {
   active_events_.clear();
 }
 void EventManager::DoExpiredTimeTasks(const TimePoint& return_time) {
+  if (!timer_.HasTasks()) {
+    return;
+  }
   Timer::ExpiredTimeTasks expired_time_tasks = timer_.GetExpiredTimeTasks();
   for (auto& expired_time_task : expired_time_tasks) {
     auto ExpiredTimeCallback = expired_time_task.second;

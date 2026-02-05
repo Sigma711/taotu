@@ -18,9 +18,13 @@ namespace taotu {
 void Timer::AddTimeTask(const TimePoint& time_point, TimeCallback TimeTask) {
   LockGuard lock_guard(mutex_lock_);
   time_points_.insert({time_point, std::move(TimeTask)});
+  task_count_.store(time_points_.size(), std::memory_order_relaxed);
 }
 
 int Timer::GetMinTimeDuration() const {
+  if (!HasTasks()) {
+    return 10000;
+  }
   LockGuard lock_guard(mutex_lock_);
   if (time_points_.empty()) {
     return 10000;
@@ -33,6 +37,9 @@ int Timer::GetMinTimeDuration() const {
 
 Timer::ExpiredTimeTasks Timer::GetExpiredTimeTasks() {
   ExpiredTimeTasks expired_time_tasks;
+  if (!HasTasks()) {
+    return expired_time_tasks;
+  }
   {
     LockGuard lock_guard(mutex_lock_);
     TimePoints::iterator itr;
@@ -42,6 +49,7 @@ Timer::ExpiredTimeTasks Timer::GetExpiredTimeTasks() {
       expired_time_tasks.emplace_back(itr->first, itr->second);
     }
     time_points_.erase(time_points_.begin(), itr);
+    task_count_.store(time_points_.size(), std::memory_order_relaxed);
   }
   return expired_time_tasks;
 }

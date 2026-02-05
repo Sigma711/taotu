@@ -16,6 +16,7 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 
@@ -26,6 +27,10 @@ namespace taotu {
 namespace {
 constexpr uint32_t kDefaultEntries = 32768;
 constexpr uint32_t kMinEntries = 1024;
+constexpr size_t kDefaultSubmitBatch = 1;
+constexpr size_t kMaxSubmitBatch = 256;
+constexpr size_t kDefaultOpPoolLimit = 1U << 16;
+constexpr size_t kMaxOpPoolLimit = 1U << 20;
 
 uint32_t GetIoUringEntries() {
   const char* env = ::getenv("TAOTU_IORING_ENTRIES");
@@ -44,6 +49,38 @@ uint32_t GetIoUringEntries() {
     return kMinEntries;
   }
   return static_cast<uint32_t>(val);
+}
+
+size_t GetSubmitBatch() {
+  const char* env = ::getenv("TAOTU_IORING_SUBMIT_BATCH");
+  if (!env || *env == '\0') {
+    return kDefaultSubmitBatch;
+  }
+  char* end = nullptr;
+  uint64_t val = ::strtoull(env, &end, 10);
+  if (end == env || val == 0) {
+    return kDefaultSubmitBatch;
+  }
+  if (val > kMaxSubmitBatch) {
+    return kMaxSubmitBatch;
+  }
+  return static_cast<size_t>(val);
+}
+
+size_t GetOpPoolLimit() {
+  const char* env = ::getenv("TAOTU_IORING_OP_POOL_LIMIT");
+  if (!env || *env == '\0') {
+    return kDefaultOpPoolLimit;
+  }
+  char* end = nullptr;
+  uint64_t val = ::strtoull(env, &end, 10);
+  if (end == env) {
+    return kDefaultOpPoolLimit;
+  }
+  if (val > kMaxOpPoolLimit) {
+    return kMaxOpPoolLimit;
+  }
+  return static_cast<size_t>(val);
 }
 }  // namespace
 
@@ -98,6 +135,9 @@ Poller::Poller() {
   if (use_sqpoll_) {
     LOG_DEBUG("io_uring initialized with SQPOLL.");
   }
+  submit_batch_ = GetSubmitBatch();
+  op_pool_limit_ = GetOpPoolLimit();
+  op_pool_.reserve(std::min(op_pool_limit_, static_cast<size_t>(2048)));
   struct io_uring_probe* probe = ::io_uring_get_probe_ring(&ring_);
   if (probe) {
     if (!::io_uring_opcode_supported(probe, IORING_OP_ACCEPT)) {
@@ -110,6 +150,10 @@ Poller::Poller() {
 }
 
 Poller::~Poller() {
+  for (auto* op : op_pool_) {
+    delete op;
+  }
+  op_pool_.clear();
   UnregisterBuffers();
   ::io_uring_queue_exit(&ring_);
 }
@@ -125,12 +169,50 @@ Poller::IoUringOp* Poller::DecodeOp(uint64_t token) {
   return reinterpret_cast<IoUringOp*>(static_cast<uintptr_t>(token));
 }
 
+Poller::IoUringOp* Poller::AcquireOp(OpType type, Eventer* eventer, void* ctx,
+                                     int fd, CompletionFn completion,
+                                     ContextDeleter context_deleter) {
+  IoUringOp* op = nullptr;
+  if (!op_pool_.empty()) {
+    op = op_pool_.back();
+    op_pool_.pop_back();
+  } else {
+    op = new IoUringOp;
+  }
+  op->type = type;
+  op->eventer = eventer;
+  op->context = ctx;
+  op->fd = fd;
+  op->completion = completion;
+  op->context_deleter = context_deleter;
+  op->state.store(IoUringOp::State::kInflight, std::memory_order_relaxed);
+  return op;
+}
+
+void Poller::RecycleOp(IoUringOp* op) {
+  if (!op) {
+    return;
+  }
+  op->type = OpType::kNone;
+  op->eventer = nullptr;
+  op->context = nullptr;
+  op->fd = -1;
+  op->completion = nullptr;
+  op->context_deleter = nullptr;
+  op->state.store(IoUringOp::State::kInit, std::memory_order_relaxed);
+  if (op_pool_.size() < op_pool_limit_) {
+    op_pool_.push_back(op);
+  } else {
+    delete op;
+  }
+}
+
 void Poller::AddEventer(Eventer* eventer) {
   eventer->poll_mask_ = eventer->Events();
   eventer->poll_armed_ = false;
   eventer->poll_token_ = 0;
   SubmitPoll(eventer);
-  SubmitPending();
+  SubmitPending(true);
 }
 
 void Poller::ModifyEventer(Eventer* eventer) {
@@ -140,7 +222,7 @@ void Poller::ModifyEventer(Eventer* eventer) {
   } else {
     SubmitPoll(eventer);
   }
-  SubmitPending();
+  SubmitPending(true);
 }
 
 void Poller::RemoveEventer(Eventer* eventer) {
@@ -156,12 +238,16 @@ uint64_t Poller::SubmitRead(Eventer* eventer, struct iovec* iov, int iovcnt,
   (void)key;
   struct io_uring_sqe* sqe = ::io_uring_get_sqe(&ring_);
   if (!sqe) {
+    SubmitPending(true);
+    sqe = ::io_uring_get_sqe(&ring_);
+  }
+  if (!sqe) {
     LOG_ERROR("io_uring_get_sqe failed when submit read fd(%d)", eventer->Fd());
     return 0;
   }
-  auto* op = new IoUringOp{OpType::kRead, eventer,    ctx,
-                           eventer->Fd(), completion, context_deleter};
-  op->state.store(IoUringOp::State::kInflight, std::memory_order_relaxed);
+  auto* op =
+      AcquireOp(OpType::kRead, eventer, ctx, eventer->Fd(), completion,
+                context_deleter);
   uint64_t token = EncodeOp(op);
   ::io_uring_prep_readv(sqe, eventer->Fd(), iov, iovcnt, 0);
   ::io_uring_sqe_set_data64(sqe, token);
@@ -177,13 +263,17 @@ uint64_t Poller::SubmitReadMultishot(Eventer* eventer, int buf_group,
   (void)key;
   struct io_uring_sqe* sqe = ::io_uring_get_sqe(&ring_);
   if (!sqe) {
+    SubmitPending(true);
+    sqe = ::io_uring_get_sqe(&ring_);
+  }
+  if (!sqe) {
     LOG_ERROR("io_uring_get_sqe failed when submit recv-multishot fd(%d)",
               eventer->Fd());
     return 0;
   }
-  auto* op = new IoUringOp{OpType::kRead, eventer,    ctx,
-                           eventer->Fd(), completion, context_deleter};
-  op->state.store(IoUringOp::State::kInflight, std::memory_order_relaxed);
+  auto* op =
+      AcquireOp(OpType::kRead, eventer, ctx, eventer->Fd(), completion,
+                context_deleter);
   uint64_t token = EncodeOp(op);
   ::io_uring_prep_recv(sqe, eventer->Fd(), nullptr, 0, 0);
   sqe->ioprio |= IORING_RECV_MULTISHOT;
@@ -209,13 +299,17 @@ uint64_t Poller::SubmitWrite(Eventer* eventer, struct iovec* iov, int iovcnt,
   (void)key;
   struct io_uring_sqe* sqe = ::io_uring_get_sqe(&ring_);
   if (!sqe) {
+    SubmitPending(true);
+    sqe = ::io_uring_get_sqe(&ring_);
+  }
+  if (!sqe) {
     LOG_ERROR("io_uring_get_sqe failed when submit write fd(%d)",
               eventer->Fd());
     return 0;
   }
-  auto* op = new IoUringOp{OpType::kWrite, eventer,    ctx,
-                           eventer->Fd(),  completion, context_deleter};
-  op->state.store(IoUringOp::State::kInflight, std::memory_order_relaxed);
+  auto* op =
+      AcquireOp(OpType::kWrite, eventer, ctx, eventer->Fd(), completion,
+                context_deleter);
   uint64_t token = EncodeOp(op);
   ::io_uring_prep_writev(sqe, eventer->Fd(), iov, iovcnt, 0);
   ::io_uring_sqe_set_data64(sqe, token);
@@ -229,12 +323,15 @@ uint64_t Poller::SubmitAccept(int fd, struct sockaddr* addr, socklen_t* addrlen,
   (void)key;
   struct io_uring_sqe* sqe = ::io_uring_get_sqe(&ring_);
   if (!sqe) {
+    SubmitPending(true);
+    sqe = ::io_uring_get_sqe(&ring_);
+  }
+  if (!sqe) {
     LOG_ERROR("io_uring_get_sqe failed when submit accept fd(%d)", fd);
     return 0;
   }
-  auto* op = new IoUringOp{OpType::kAccept, nullptr,        ctx, fd,
-                           completion,      context_deleter};
-  op->state.store(IoUringOp::State::kInflight, std::memory_order_relaxed);
+  auto* op = AcquireOp(OpType::kAccept, nullptr, ctx, fd, completion,
+                       context_deleter);
   uint64_t token = EncodeOp(op);
   if (multishot && use_multishot_accept_) {
 #ifdef IORING_ACCEPT_MULTISHOT
@@ -268,6 +365,10 @@ bool Poller::CancelOp(uint64_t user_data_key) {
   op->completion = nullptr;
   struct io_uring_sqe* sqe = ::io_uring_get_sqe(&ring_);
   if (!sqe) {
+    SubmitPending(true);
+    sqe = ::io_uring_get_sqe(&ring_);
+  }
+  if (!sqe) {
     LOG_ERROR("io_uring_get_sqe failed when cancel op");
     return true;
   }
@@ -277,6 +378,7 @@ bool Poller::CancelOp(uint64_t user_data_key) {
   return true;
 }
 TimePoint Poller::Poll(int timeout, EventerList* active_eventers) {
+  SubmitPending(true);
   struct __kernel_timespec ts {};
   struct __kernel_timespec* tsp = nullptr;
   if (timeout >= 0) {
@@ -288,12 +390,12 @@ TimePoint Poller::Poll(int timeout, EventerList* active_eventers) {
   struct io_uring_cqe* cqe = nullptr;
   int ret = ::io_uring_wait_cqe_timeout(&ring_, &cqe, tsp);
   if (ret == -ETIME) {
-    SubmitPending();
+    SubmitPending(true);
     return TimePoint::FromMicroseconds(TimePoint::FNowRaw());
   }
   if (ret < 0) {
     LOG_ERROR("io_uring_wait_cqe_timeout failed: %s", ::strerror(-ret));
-    SubmitPending();
+    SubmitPending(true);
     return TimePoint::FromMicroseconds(TimePoint::FNowRaw());
   }
 
@@ -332,7 +434,7 @@ TimePoint Poller::Poll(int timeout, EventerList* active_eventers) {
 
   now_us = TimePoint::FNowRaw();
   now_cache.Update(now_us);
-  SubmitPending();
+  SubmitPending(true);
   return TimePoint::FromMicroseconds(now_us);
 }
 
@@ -359,7 +461,7 @@ void Poller::HandleCqe(struct io_uring_cqe* cqe, EventerList* active_eventers) {
       ReleaseBufferFromCqe(cqe);
       op->state.store(IoUringOp::State::kDone, std::memory_order_relaxed);
       if (!keep_op) {
-        delete op;
+        RecycleOp(op);
       }
       return;
     }
@@ -368,7 +470,7 @@ void Poller::HandleCqe(struct io_uring_cqe* cqe, EventerList* active_eventers) {
     ReleaseBufferFromCqe(cqe);
     if (!keep_op) {
       op->state.store(IoUringOp::State::kDone, std::memory_order_relaxed);
-      delete op;
+      RecycleOp(op);
     }
     return;
   }
@@ -428,7 +530,7 @@ void Poller::HandleCqe(struct io_uring_cqe* cqe, EventerList* active_eventers) {
   }
   op->state.store(IoUringOp::State::kDone, std::memory_order_relaxed);
   if (!keep_op) {
-    delete op;
+    RecycleOp(op);
   }
 }
 
@@ -446,12 +548,16 @@ void Poller::SubmitPoll(Eventer* eventer) {
   }
   struct io_uring_sqe* sqe = ::io_uring_get_sqe(&ring_);
   if (!sqe) {
+    SubmitPending(true);
+    sqe = ::io_uring_get_sqe(&ring_);
+  }
+  if (!sqe) {
     LOG_ERROR("io_uring_get_sqe failed when arming fd(%d)", eventer->Fd());
     return;
   }
-  auto* op = new IoUringOp{OpType::kPoll, eventer, nullptr,
-                           eventer->Fd(), nullptr, nullptr};
-  op->state.store(IoUringOp::State::kInflight, std::memory_order_relaxed);
+  auto* op =
+      AcquireOp(OpType::kPoll, eventer, nullptr, eventer->Fd(), nullptr,
+                nullptr);
   uint64_t token = EncodeOp(op);
   ::io_uring_prep_poll_add(sqe, eventer->Fd(),
                            static_cast<unsigned>(eventer->poll_mask_));
@@ -469,7 +575,14 @@ void Poller::CancelPoll(Eventer* eventer) {
   eventer->poll_token_ = 0;
 }
 
-void Poller::SubmitPending() {
+void Poller::SubmitPending(bool force) {
+  const unsigned ready = ::io_uring_sq_ready(&ring_);
+  if (ready == 0) {
+    return;
+  }
+  if (!force && ready < submit_batch_) {
+    return;
+  }
   int ret = ::io_uring_submit(&ring_);
   if (ret < 0) {
     LOG_ERROR("io_uring_submit failed: %s", ::strerror(-ret));
@@ -521,7 +634,7 @@ void Poller::UnregisterBuffers() {
   }
   ::io_uring_prep_remove_buffers(sqe, kBufCount, kBufferGroupId);
   ::io_uring_sqe_set_data64(sqe, 0);
-  ::io_uring_submit(&ring_);
+  SubmitPending(true);
   buffers_registered_ = false;
 #endif
 }
@@ -541,8 +654,12 @@ void Poller::ReleaseBufferFromCqe(struct io_uring_cqe* cqe) {
   }
   struct io_uring_sqe* sqe = ::io_uring_get_sqe(&ring_);
   if (!sqe) {
-    LOG_WARN("io_uring_get_sqe failed when release buffer");
-    return;
+    SubmitPending(true);
+    sqe = ::io_uring_get_sqe(&ring_);
+    if (!sqe) {
+      LOG_WARN("io_uring_get_sqe failed when release buffer");
+      return;
+    }
   }
   ::io_uring_prep_provide_buffers(sqe, buffers_[bid], kBufSize, 1,
                                   kBufferGroupId, bid);

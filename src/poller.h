@@ -102,12 +102,16 @@ class Poller : NonCopyableMovable {
  private:
   static uint64_t EncodeOp(IoUringOp* op);
   static IoUringOp* DecodeOp(uint64_t token);
+  IoUringOp* AcquireOp(OpType type, Eventer* eventer, void* ctx, int fd,
+                       CompletionFn completion,
+                       ContextDeleter context_deleter);
+  void RecycleOp(IoUringOp* op);
   void CleanupOpContext(IoUringOp* op);
 
   void SubmitPoll(Eventer* eventer);
   void CancelPoll(Eventer* eventer);
   void HandleCqe(struct io_uring_cqe* cqe, EventerList* active_eventers);
-  void SubmitPending();
+  void SubmitPending(bool force = false);
   void RegisterBuffers();
   void UnregisterBuffers();
   void ReleaseBufferFromCqe(struct io_uring_cqe* cqe);
@@ -117,6 +121,9 @@ class Poller : NonCopyableMovable {
   bool use_multishot_accept_{true};
   bool buffers_registered_{false};
   std::array<char[kBufSize], kBufCount> buffers_{};
+  std::vector<IoUringOp*> op_pool_;
+  size_t op_pool_limit_{1U << 16};
+  size_t submit_batch_{1};
   size_t cqe_batch_limit_{1024};
   int64_t cqe_time_budget_us_{1000};
 };

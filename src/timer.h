@@ -14,6 +14,7 @@
 
 #include <functional>
 #include <map>
+#include <atomic>
 #include <vector>
 
 #include "non_copyable_movable.h"
@@ -44,12 +45,18 @@ class Timer : NonCopyableMovable {
   // Get a set of expired time tasks
   ExpiredTimeTasks GetExpiredTimeTasks();
 
+  bool HasTasks() const {
+    return task_count_.load(std::memory_order_relaxed) > 0;
+  }
+
  private:
   // List of all time tasks (the time points and the corresponding tasks)
   TimePoints time_points_;
 
   // Spin lock protecting the list of all time tasks
   mutable MutexLock mutex_lock_;
+
+  std::atomic<size_t> task_count_{0};
 };
 
 }  // namespace taotu

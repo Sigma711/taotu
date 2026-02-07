@@ -38,6 +38,15 @@ cmake --build build_release -j
 
 以下变量会在进程启动时由 `Poller` 读取：
 
+- `TAOTU_ENABLE_BUF_RING`
+  - 默认：开启（尽力启用）
+  - 作用：启用 io_uring 的 buffer ring（`buf_ring`）作为 provided-buffer 的回收机制
+    （值非空且不为 `'0'` 时启用）。当开启且系统内核/liburing 支持时，recv-multishot
+    的 buffer 归还会变成纯用户态操作（不再需要额外提交 `IORING_OP_PROVIDE_BUFFERS` SQE）。
+- `TAOTU_DISABLE_BUF_RING`
+  - 默认：关闭
+  - 作用：强制关闭 `buf_ring` 的 provided-buffer 路径，回退到旧的
+    `IORING_OP_PROVIDE_BUFFERS` 机制（值非空且不为 `'0'` 时禁用），优先级高于 `TAOTU_ENABLE_BUF_RING`。
 - `TAOTU_IORING_ENTRIES`
   - 默认值：`32768`
   - 限制范围：`[1024, 32768]`
@@ -52,7 +61,7 @@ cmake --build build_release -j
   - 默认：关闭
   - 作用：关闭 recv-multishot + provided-buffer 注册路径。
 - `TAOTU_IORING_SUBMIT_BATCH`
-  - 默认值：`1`
+  - 默认值：`16`
   - 最大限制：`256`
   - 作用：当待提交 SQE 数达到该阈值时触发提交（事件循环中也可能被强制提交）。
 - `TAOTU_IORING_OP_POOL_LIMIT`

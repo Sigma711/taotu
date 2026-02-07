@@ -38,6 +38,17 @@ You can configure build behavior with:
 
 These are read at process startup by `Poller`:
 
+- `TAOTU_ENABLE_BUF_RING`
+  - Default: enabled (best effort)
+  - Effect: enable io_uring buffer ring (`buf_ring`) for provided buffers
+    (values non-empty and not `'0'` enable). When enabled and supported by the
+    running kernel/liburing, returning a recv-multishot provided buffer becomes
+    a user-space operation (no extra `IORING_OP_PROVIDE_BUFFERS` SQE).
+- `TAOTU_DISABLE_BUF_RING`
+  - Default: disabled
+  - Effect: force-disable `buf_ring` provided-buffer path and fallback to the
+    legacy `IORING_OP_PROVIDE_BUFFERS` path (`non-empty` and not `'0'` disables),
+    takes precedence over `TAOTU_ENABLE_BUF_RING`.
 - `TAOTU_IORING_ENTRIES`
   - Default: `32768`
   - Clamp range: `[1024, 32768]`
@@ -52,7 +63,7 @@ These are read at process startup by `Poller`:
   - Default: disabled
   - Effect: disable recv-multishot + provided-buffer registration path.
 - `TAOTU_IORING_SUBMIT_BATCH`
-  - Default: `1`
+  - Default: `16`
   - Max clamp: `256`
   - Effect: submit SQEs when pending count reaches this threshold (or when forced by the loop).
 - `TAOTU_IORING_OP_POOL_LIMIT`

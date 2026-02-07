@@ -41,9 +41,11 @@ class Timer : NonCopyableMovable {
 
   // Get minimum time duration for next io_uring wait
   int GetMinTimeDuration() const;
+  int GetMinTimeDuration(const TimePoint& now) const;
 
   // Get a set of expired time tasks
   ExpiredTimeTasks GetExpiredTimeTasks();
+  ExpiredTimeTasks GetExpiredTimeTasks(const TimePoint& now);
 
   bool HasTasks() const {
     return task_count_.load(std::memory_order_relaxed) > 0;

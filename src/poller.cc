@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/eventfd.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -27,11 +28,24 @@ namespace taotu {
 namespace {
 constexpr uint32_t kDefaultEntries = 32768;
 constexpr uint32_t kMinEntries = 1024;
-constexpr size_t kDefaultSubmitBatch = 1;
+constexpr size_t kDefaultSubmitBatch = 16;
 constexpr size_t kMaxSubmitBatch = 256;
 constexpr size_t kDefaultOpPoolLimit = 1U << 16;
 constexpr size_t kMaxOpPoolLimit = 1U << 20;
 constexpr size_t kDefaultBorrowedBufLimit = Poller::kBufCount / 2;
+
+bool WantBufRing() {
+  const char* disable = ::getenv("TAOTU_DISABLE_BUF_RING");
+  if (disable && *disable != '\0' && *disable != '0') {
+    return false;
+  }
+  const char* enable = ::getenv("TAOTU_ENABLE_BUF_RING");
+  if (enable && *enable != '\0' && *enable != '0') {
+    return true;
+  }
+  // Default on: buf_ring avoids per-buffer PROVIDE_BUFFERS SQEs.
+  return true;
+}
 
 uint32_t GetIoUringEntries() {
   const char* env = ::getenv("TAOTU_IORING_ENTRIES");
@@ -462,7 +476,6 @@ bool Poller::CancelOp(uint64_t user_data_key) {
   return true;
 }
 TimePoint Poller::Poll(int timeout, EventerList* active_eventers) {
-  SubmitPending(true);
   struct __kernel_timespec ts {};
   struct __kernel_timespec* tsp = nullptr;
   if (timeout >= 0) {
@@ -472,54 +485,69 @@ TimePoint Poller::Poll(int timeout, EventerList* active_eventers) {
   }
 
   struct io_uring_cqe* cqe = nullptr;
-  int ret = ::io_uring_wait_cqe_timeout(&ring_, &cqe, tsp);
+  int ret = ::io_uring_peek_cqe(&ring_, &cqe);
+  if (ret == -EAGAIN) {
+    // Submit pending SQEs and wait for at least one CQE in a single syscall.
+    ret = ::io_uring_submit_and_wait_timeout(&ring_, &cqe, 1, tsp, nullptr);
+  }
   if (ret == -ETIME) {
-    SubmitPending(true);
     return TimePoint::FromMicroseconds(TimePoint::FNowRaw());
   }
   if (ret < 0) {
-    LOG_ERROR("io_uring_wait_cqe_timeout failed: %s", ::strerror(-ret));
-    SubmitPending(true);
+    LOG_ERROR("io_uring wait failed: %s", ::strerror(-ret));
+    return TimePoint::FromMicroseconds(TimePoint::FNowRaw());
+  }
+  if (cqe == nullptr) {
+    // Defensive: should not happen, but avoid returning an uninitialized time.
     return TimePoint::FromMicroseconds(TimePoint::FNowRaw());
   }
 
   int64_t now_us = TimePoint::FNowRaw();
-  const int64_t start_us = now_us;
+  TimePoint now = TimePoint::FromMicroseconds(now_us);
   TimePoint::NowCacheGuard now_cache(now_us);
-  HandleCqe(cqe, active_eventers);
+  HandleCqe(cqe, now, active_eventers);
   ::io_uring_cqe_seen(&ring_, cqe);
 
   // Continue draining all completed CQEs.
   const size_t limit = cqe_batch_limit_;
   const int64_t budget_us = cqe_time_budget_us_;
-  size_t since_last_clock_check = 0;
+  const int64_t start_us = now_us;
   size_t handled = 1;
   while (limit == 0 || handled < limit) {
-    // Avoid querying time for every CQE. We only refresh cached "now"
-    // periodically, which keeps timer precision within one CQE batch chunk.
-    if (budget_us > 0 && (++since_last_clock_check & 31U) == 0U) {
+    struct io_uring_cqe* cqes[64];
+    unsigned want = static_cast<unsigned>(sizeof(cqes) / sizeof(cqes[0]));
+    if (limit != 0) {
+      size_t remaining = limit - handled;
+      if (remaining < want) {
+        want = static_cast<unsigned>(remaining);
+      }
+    }
+    unsigned got = ::io_uring_peek_batch_cqe(&ring_, cqes, want);
+    if (got == 0) {
+      break;
+    }
+    for (unsigned i = 0; i < got; ++i) {
+      HandleCqe(cqes[i], now, active_eventers);
+      ::io_uring_cqe_seen(&ring_, cqes[i]);
+      ++handled;
+      if (limit != 0 && handled >= limit) {
+        break;
+      }
+    }
+    if (budget_us > 0) {
+      // Don't query time per CQE. Only check once per drained chunk.
       now_us = TimePoint::FNowRaw();
       now_cache.Update(now_us);
+      now = TimePoint::FromMicroseconds(now_us);
       if ((now_us - start_us) >= budget_us) {
         break;
       }
     }
-    ret = ::io_uring_peek_cqe(&ring_, &cqe);
-    if (ret == -EAGAIN) {
-      break;
-    } else if (ret < 0) {
-      LOG_ERROR("io_uring_peek_cqe failed: %s", ::strerror(-ret));
-      break;
-    }
-    HandleCqe(cqe, active_eventers);
-    ::io_uring_cqe_seen(&ring_, cqe);
-    ++handled;
   }
 
-  now_us = TimePoint::FNowRaw();
-  now_cache.Update(now_us);
-  SubmitPending(true);
-  return TimePoint::FromMicroseconds(now_us);
+  // Best-effort flush: allow batching via submit_batch_.
+  SubmitPending(false);
+  return now;
 }
 
 uint64_t Poller::SubmitWriteProvidedBuffers(
@@ -600,7 +628,8 @@ uint64_t Poller::SubmitWriteProvidedBuffers(
 #endif
 }
 
-void Poller::HandleCqe(struct io_uring_cqe* cqe, EventerList* active_eventers) {
+void Poller::HandleCqe(struct io_uring_cqe* cqe, const TimePoint& now,
+                       EventerList* active_eventers) {
   uint64_t token = cqe->user_data;
   if (token == 0) {
     ReleaseBufferFromCqe(cqe);
@@ -669,7 +698,7 @@ void Poller::HandleCqe(struct io_uring_cqe* cqe, EventerList* active_eventers) {
       Eventer::ReadResult rr{.bytes = cqe->res,
                              .err = cqe->res < 0 ? -cqe->res : 0};
       ReleaseBufferFromCqe(cqe);
-      eventer->OnReadDone(rr, TimePoint{});
+      eventer->OnReadDone(rr, now);
       break;
     }
     case OpType::kWrite: {
@@ -769,6 +798,52 @@ void Poller::RegisterBuffers() {
   if (!buffers_) {
     buffers_.reset(new char[kBufCount * kBufSize]);
   }
+
+  // Prefer buf_ring if available. It makes buffer return a pure user-space op,
+  // instead of emitting an IORING_OP_PROVIDE_BUFFERS SQE per CQE.
+  if (WantBufRing()) {
+    int ret = 0;
+    unsigned entries = static_cast<unsigned>(kBufCount);
+    // Must be power-of-two for mask helpers.
+    if ((entries & (entries - 1U)) != 0) {
+      // Next pow2.
+      unsigned p = 1;
+      while (p < entries) {
+        p <<= 1U;
+      }
+      entries = p;
+    }
+    struct io_uring_buf_ring* br =
+        ::io_uring_setup_buf_ring(&ring_, entries, kBufferGroupId, 0, &ret);
+    if (ret == 0 && br != nullptr) {
+      use_buf_ring_ = true;
+      buf_ring_ = br;
+      buf_ring_entries_ = entries;
+      buf_ring_mask_ = ::io_uring_buf_ring_mask(entries);
+      ::io_uring_buf_ring_init(buf_ring_);
+      for (unsigned i = 0; i < static_cast<unsigned>(kBufCount); ++i) {
+        ::io_uring_buf_ring_add(
+            buf_ring_, buffers_.get() + (static_cast<size_t>(i) * kBufSize),
+            kBufSize, i, buf_ring_mask_, i);
+      }
+      ::io_uring_buf_ring_advance(buf_ring_, static_cast<unsigned>(kBufCount));
+      buffers_registered_ = true;
+      LOG_DEBUG("buf_ring enabled for provided buffers (entries=%u, bgid=%d).",
+                buf_ring_entries_, kBufferGroupId);
+      return;
+    }
+    if (ret != 0) {
+      LOG_WARN("buf_ring unavailable, fallback to PROVIDE_BUFFERS: %s",
+               ::strerror(-ret));
+    } else {
+      LOG_WARN("buf_ring setup returned null, fallback to PROVIDE_BUFFERS.");
+    }
+    use_buf_ring_ = false;
+    buf_ring_ = nullptr;
+    buf_ring_entries_ = 0;
+    buf_ring_mask_ = 0;
+  }
+
   struct io_uring_sqe* sqe = ::io_uring_get_sqe(&ring_);
   if (!sqe) {
     LOG_WARN("io_uring_get_sqe failed when registering buffers, skip.");
@@ -798,6 +873,16 @@ void Poller::RegisterBuffers() {
 void Poller::UnregisterBuffers() {
 #ifdef IORING_RECV_MULTISHOT
   if (!buffers_registered_) {
+    return;
+  }
+  if (use_buf_ring_ && buf_ring_ != nullptr) {
+    ::io_uring_free_buf_ring(&ring_, buf_ring_, buf_ring_entries_,
+                             kBufferGroupId);
+    buf_ring_ = nullptr;
+    buf_ring_entries_ = 0;
+    buf_ring_mask_ = 0;
+    use_buf_ring_ = false;
+    buffers_registered_ = false;
     return;
   }
   struct io_uring_sqe* sqe = ::io_uring_get_sqe(&ring_);
@@ -845,6 +930,13 @@ void Poller::ReturnBuffer(uint16_t bid) {
     if (leased_buffer_count_ > 0) {
       --leased_buffer_count_;
     }
+  }
+  if (use_buf_ring_ && buf_ring_ != nullptr) {
+    ::io_uring_buf_ring_add(
+        buf_ring_, buffers_.get() + (static_cast<size_t>(bid) * kBufSize),
+        kBufSize, bid, buf_ring_mask_, 0);
+    ::io_uring_buf_ring_advance(buf_ring_, 1);
+    return;
   }
   struct io_uring_sqe* sqe = ::io_uring_get_sqe(&ring_);
   if (!sqe) {

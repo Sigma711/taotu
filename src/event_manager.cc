@@ -200,11 +200,15 @@ void EventManager::Quit() {
 void EventManager::Start() {
   should_quit_.store(false);
   LOG_DEBUG("The event loop in thread(%lu) is starting.", ::pthread_self());
+  // Cache "now" across loop body to avoid repeated gettimeofday() in Timer.
+  TimePoint loop_now;
   while (!should_quit_.load()) {
+    int timeout_ms = timer_.GetMinTimeDuration(loop_now);
     auto return_time =
-        poller_.Poll(timer_.GetMinTimeDuration(),
-                     &active_events_);  // Return time is the time point of
-                                        // the end of this polling
+        poller_.Poll(timeout_ms, &active_events_);  // Return time is the time
+                                                    // point of the end of this
+                                                    // polling
+    loop_now = return_time;
     DoWithActiveTasks(return_time);
     DoExpiredTimeTasks(return_time);
     DestroyClosedConnections();
@@ -238,8 +242,8 @@ void EventManager::Start() {
     if (!has_connections && !has_closed) {
       break;
     }
-    poller_.Poll(1, &active_events_);
-    DoWithActiveTasks(TimePoint{});
+    TimePoint return_time = poller_.Poll(1, &active_events_);
+    DoWithActiveTasks(return_time);
     DestroyClosedConnections();
   }
   {
@@ -258,7 +262,8 @@ void EventManager::DoExpiredTimeTasks(const TimePoint& return_time) {
   if (!timer_.HasTasks()) {
     return;
   }
-  Timer::ExpiredTimeTasks expired_time_tasks = timer_.GetExpiredTimeTasks();
+  Timer::ExpiredTimeTasks expired_time_tasks =
+      timer_.GetExpiredTimeTasks(return_time);
   for (auto& expired_time_task : expired_time_tasks) {
     auto ExpiredTimeCallback = expired_time_task.second;
     if (ExpiredTimeCallback) {

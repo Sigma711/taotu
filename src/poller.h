@@ -116,6 +116,7 @@ class Poller : NonCopyableMovable {
   bool UseSqpoll() const { return use_sqpoll_; }
   bool UseMultishotAccept() const { return use_multishot_accept_; }
   bool BuffersRegistered() const { return buffers_registered_; }
+  bool UseBufRing() const { return use_buf_ring_; }
   size_t BufferCount() const { return kBufCount; }
   // The buffer pointer is valid while Poller's provided-buffer pool is
   // registered. For recv-multishot buffers, it must be returned via
@@ -138,7 +139,8 @@ class Poller : NonCopyableMovable {
 
   void SubmitPoll(Eventer* eventer);
   void CancelPoll(Eventer* eventer);
-  void HandleCqe(struct io_uring_cqe* cqe, EventerList* active_eventers);
+  void HandleCqe(struct io_uring_cqe* cqe, const TimePoint& now,
+                 EventerList* active_eventers);
   void SubmitPending(bool force = false);
   void RegisterBuffers();
   void UnregisterBuffers();
@@ -148,6 +150,10 @@ class Poller : NonCopyableMovable {
   bool use_sqpoll_{false};
   bool use_multishot_accept_{true};
   bool buffers_registered_{false};
+  bool use_buf_ring_{false};
+  struct io_uring_buf_ring* buf_ring_{nullptr};
+  unsigned buf_ring_entries_{0};
+  unsigned buf_ring_mask_{0};
   // Large provided-buffer pool for recv-multishot. Stored on heap to avoid
   // inflating Poller size (EventManager is often stack-allocated in tests).
   // Not value-initialized to avoid touching (zeroing) large memory on Poller

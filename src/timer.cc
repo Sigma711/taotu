@@ -22,6 +22,10 @@ void Timer::AddTimeTask(const TimePoint& time_point, TimeCallback TimeTask) {
 }
 
 int Timer::GetMinTimeDuration() const {
+  return GetMinTimeDuration(TimePoint{});
+}
+
+int Timer::GetMinTimeDuration(const TimePoint& now) const {
   if (!HasTasks()) {
     return 10000;
   }
@@ -30,12 +34,16 @@ int Timer::GetMinTimeDuration() const {
     return 10000;
   }
   int duration = static_cast<int>(time_points_.begin()->first.GetMillisecond() -
-                                  TimePoint().GetMillisecond());
+                                  now.GetMillisecond());
   return duration > 0 ? duration
                       : 0;  // Could not give a negative value of the duration
 }
 
 Timer::ExpiredTimeTasks Timer::GetExpiredTimeTasks() {
+  return GetExpiredTimeTasks(TimePoint{});
+}
+
+Timer::ExpiredTimeTasks Timer::GetExpiredTimeTasks(const TimePoint& now) {
   ExpiredTimeTasks expired_time_tasks;
   if (!HasTasks()) {
     return expired_time_tasks;
@@ -43,7 +51,6 @@ Timer::ExpiredTimeTasks Timer::GetExpiredTimeTasks() {
   {
     LockGuard lock_guard(mutex_lock_);
     TimePoints::iterator itr;
-    TimePoint now;
     for (itr = time_points_.begin();
          itr != time_points_.end() && itr->first <= now; ++itr) {
       expired_time_tasks.emplace_back(itr->first, itr->second);

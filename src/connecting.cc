@@ -426,39 +426,21 @@ void Connecting::SubmitReadOnce() {
   auto* ctx = &read_ctx_storage_;
   ctx->self = this;
   read_ctx_ = ctx;
-  ctx->extra_buffer = nullptr;
-  ctx->extra_len = 0;
   ctx->key = 0;
-  ctx->multishot = false;
   ctx->buf_id = 0;
-  ctx->writable = input_buffer_.GetWritableBytes();
-  ctx->iov[0].iov_base = const_cast<char*>(input_buffer_.GetWritablePosition());
-  ctx->iov[0].iov_len = ctx->writable;
-  if (!event_manager_->GetPoller()->BuffersRegistered()) {
-    if (!extra_read_buffer_) {
-      extra_read_buffer_.reset(new char[64 * 1024]);
-    }
-    ctx->extra_buffer = extra_read_buffer_.get();
-    ctx->extra_len = 64 * 1024;
-  }
-  ctx->iov[1].iov_base = ctx->extra_buffer;
-  ctx->iov[1].iov_len = ctx->extra_len;
-  int iovcnt;
-  if (ctx->writable == 0) {
-    iovcnt = 1;
-    ctx->iov[0] = ctx->iov[1];
-  } else {
-    iovcnt = (ctx->extra_len > 0 && ctx->writable < ctx->extra_len) ? 2 : 1;
-  }
-  // ctx->key = next_io_key_++; // Deprecated: let Poller generate key
-  // read_cancel_key_ = ctx->key; // Do not set yet
+  auto* poller = event_manager_->GetPoller();
   read_in_flight_ = true;
 #ifdef IORING_RECV_MULTISHOT
-  if (event_manager_->GetPoller()->BuffersRegistered()) {
+  if (poller->BuffersRegistered()) {
+    // recv-multishot uses poller-owned provided buffers directly, so it does
+    // not need the per-submit iovec/extra-buffer setup used by one-shot reads.
     ctx->multishot = true;
-    uint64_t key = event_manager_->GetPoller()->SubmitReadMultishot(
-        &eventer_, Poller::kBufferGroupId, &Connecting::OnReadComplete, ctx, 0,
-        nullptr);
+    ctx->writable = 0;
+    ctx->extra_buffer = nullptr;
+    ctx->extra_len = 0;
+    uint64_t key = poller->SubmitReadMultishot(&eventer_, Poller::kBufferGroupId,
+                                               &Connecting::OnReadComplete, ctx,
+                                               0, nullptr);
     if (key == 0) {
       read_in_flight_ = false;
       read_cancel_key_ = 0;
@@ -475,9 +457,30 @@ void Connecting::SubmitReadOnce() {
   }
 #endif
   ctx->multishot = false;
-  uint64_t key = event_manager_->GetPoller()->SubmitRead(
-      &eventer_, ctx->iov.data(), iovcnt, &Connecting::OnReadComplete, ctx, 0,
-      nullptr);
+  ctx->extra_buffer = nullptr;
+  ctx->extra_len = 0;
+  ctx->writable = input_buffer_.GetWritableBytes();
+  ctx->iov[0].iov_base = const_cast<char*>(input_buffer_.GetWritablePosition());
+  ctx->iov[0].iov_len = ctx->writable;
+  if (!poller->BuffersRegistered()) {
+    if (!extra_read_buffer_) {
+      extra_read_buffer_.reset(new char[64 * 1024]);
+    }
+    ctx->extra_buffer = extra_read_buffer_.get();
+    ctx->extra_len = 64 * 1024;
+  }
+  ctx->iov[1].iov_base = ctx->extra_buffer;
+  ctx->iov[1].iov_len = ctx->extra_len;
+  int iovcnt;
+  if (ctx->writable == 0) {
+    iovcnt = 1;
+    ctx->iov[0] = ctx->iov[1];
+  } else {
+    iovcnt = (ctx->extra_len > 0 && ctx->writable < ctx->extra_len) ? 2 : 1;
+  }
+  uint64_t key = poller->SubmitRead(&eventer_, ctx->iov.data(), iovcnt,
+                                    &Connecting::OnReadComplete, ctx, 0,
+                                    nullptr);
   if (key == 0) {
     read_in_flight_ = false;
     read_cancel_key_ = 0;

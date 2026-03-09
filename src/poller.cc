@@ -32,7 +32,6 @@ constexpr size_t kDefaultSubmitBatch = 16;
 constexpr size_t kMaxSubmitBatch = 256;
 constexpr size_t kDefaultOpPoolLimit = 1U << 16;
 constexpr size_t kMaxOpPoolLimit = 1U << 20;
-constexpr size_t kDefaultBorrowedBufLimit = Poller::kBufCount / 2;
 
 bool WantBufRing() {
   const char* disable = ::getenv("TAOTU_DISABLE_BUF_RING");
@@ -98,21 +97,6 @@ size_t GetOpPoolLimit() {
   return static_cast<size_t>(val);
 }
 
-size_t GetBorrowedBufLimit() {
-  const char* env = ::getenv("TAOTU_IORING_BORROWED_BUFFER_LIMIT");
-  if (!env || *env == '\0') {
-    return kDefaultBorrowedBufLimit;
-  }
-  char* end = nullptr;
-  uint64_t val = ::strtoull(env, &end, 10);
-  if (end == env) {
-    return kDefaultBorrowedBufLimit;
-  }
-  if (val > Poller::kBufCount) {
-    return Poller::kBufCount;
-  }
-  return static_cast<size_t>(val);
-}
 }  // namespace
 
 Poller::Poller() {
@@ -168,7 +152,6 @@ Poller::Poller() {
   }
   submit_batch_ = GetSubmitBatch();
   op_pool_limit_ = GetOpPoolLimit();
-  leased_buffer_limit_ = GetBorrowedBufLimit();
   op_pool_.reserve(std::min(op_pool_limit_, static_cast<size_t>(2048)));
   struct io_uring_probe* probe = ::io_uring_get_probe_ring(&ring_);
   if (probe) {
@@ -217,11 +200,6 @@ Poller::IoUringOp* Poller::AcquireOp(OpType type, Eventer* eventer, void* ctx,
   op->fd = fd;
   op->completion = completion;
   op->context_deleter = context_deleter;
-  op->skip_buf_release = false;
-  op->uses_provided_buffer = false;
-  op->provided_buf_count = 0;
-  op->provided_iovs[0].iov_base = nullptr;
-  op->provided_iovs[0].iov_len = 0;
   op->state.store(IoUringOp::State::kInflight, std::memory_order_relaxed);
   return op;
 }
@@ -236,11 +214,6 @@ void Poller::RecycleOp(IoUringOp* op) {
   op->fd = -1;
   op->completion = nullptr;
   op->context_deleter = nullptr;
-  op->skip_buf_release = false;
-  op->uses_provided_buffer = false;
-  op->provided_buf_count = 0;
-  op->provided_iovs[0].iov_base = nullptr;
-  op->provided_iovs[0].iov_len = 0;
   op->state.store(IoUringOp::State::kInit, std::memory_order_relaxed);
   if (op_pool_.size() < op_pool_limit_) {
     op_pool_.push_back(op);
@@ -354,65 +327,6 @@ uint64_t Poller::SubmitWrite(Eventer* eventer, struct iovec* iov, int iovcnt,
   ::io_uring_sqe_set_data64(sqe, token);
   SubmitPending();
   return token;
-}
-
-uint64_t Poller::SubmitWriteProvidedBuffer(Eventer* eventer, uint16_t buf_id,
-                                           size_t offset, size_t len,
-                                           CompletionFn completion, void* ctx,
-                                           uint64_t key,
-                                           ContextDeleter context_deleter) {
-#ifdef IORING_RECV_MULTISHOT
-  (void)key;
-  if (!buffers_registered_) {
-    return 0;
-  }
-  if (!buffers_) {
-    return 0;
-  }
-  if (buf_id >= kBufCount) {
-    LOG_WARN("SubmitWriteProvidedBuffer: buffer id out of range: %u", buf_id);
-    return 0;
-  }
-  if (len == 0 || offset >= kBufSize || (offset + len) > kBufSize) {
-    LOG_WARN("SubmitWriteProvidedBuffer: invalid range (id=%u off=%zu len=%zu)",
-             buf_id, offset, len);
-    return 0;
-  }
-  struct io_uring_sqe* sqe = ::io_uring_get_sqe(&ring_);
-  if (!sqe) {
-    SubmitPending(true);
-    sqe = ::io_uring_get_sqe(&ring_);
-  }
-  if (!sqe) {
-    LOG_ERROR("io_uring_get_sqe failed when submit provided write fd(%d)",
-              eventer->Fd());
-    return 0;
-  }
-  auto* op = AcquireOp(OpType::kWrite, eventer, ctx, eventer->Fd(), completion,
-                       context_deleter);
-  op->uses_provided_buffer = true;
-  op->provided_buf_count = 1;
-  op->provided_buf_ids[0] = buf_id;
-  op->provided_iovs[0].iov_base = static_cast<void*>(
-      buffers_.get() + (static_cast<size_t>(buf_id) * kBufSize) +
-      static_cast<size_t>(offset));
-  op->provided_iovs[0].iov_len = len;
-  uint64_t token = EncodeOp(op);
-  ::io_uring_prep_writev(sqe, eventer->Fd(), op->provided_iovs.data(), 1, 0);
-  ::io_uring_sqe_set_data64(sqe, token);
-  SubmitPending();
-  return token;
-#else
-  (void)eventer;
-  (void)buf_id;
-  (void)offset;
-  (void)len;
-  (void)completion;
-  (void)ctx;
-  (void)key;
-  (void)context_deleter;
-  return 0;
-#endif
 }
 
 uint64_t Poller::SubmitAccept(int fd, struct sockaddr* addr, socklen_t* addrlen,
@@ -550,84 +464,6 @@ TimePoint Poller::Poll(int timeout, EventerList* active_eventers) {
   return now;
 }
 
-uint64_t Poller::SubmitWriteProvidedBuffers(
-    Eventer* eventer, const uint16_t* buf_ids, const size_t* offsets,
-    const size_t* lens, size_t count, CompletionFn completion, void* ctx,
-    uint64_t key, ContextDeleter context_deleter) {
-#ifdef IORING_RECV_MULTISHOT
-  (void)key;
-  if (!buffers_registered_) {
-    return 0;
-  }
-  if (!buffers_) {
-    return 0;
-  }
-  if (!buf_ids || !offsets || !lens || count == 0) {
-    return 0;
-  }
-  if (count > IoUringOp::kProvidedIovMax) {
-    LOG_WARN("SubmitWriteProvidedBuffers: too many iovecs: %zu", count);
-    return 0;
-  }
-  for (size_t i = 0; i < count; ++i) {
-    const uint16_t bid = buf_ids[i];
-    const size_t off = offsets[i];
-    const size_t len = lens[i];
-    if (bid >= kBufCount) {
-      LOG_WARN("SubmitWriteProvidedBuffers: buffer id out of range: %u", bid);
-      return 0;
-    }
-    if (len == 0 || off >= kBufSize || (off + len) > kBufSize) {
-      LOG_WARN(
-          "SubmitWriteProvidedBuffers: invalid range (id=%u off=%zu len=%zu)",
-          bid, off, len);
-      return 0;
-    }
-  }
-  struct io_uring_sqe* sqe = ::io_uring_get_sqe(&ring_);
-  if (!sqe) {
-    SubmitPending(true);
-    sqe = ::io_uring_get_sqe(&ring_);
-  }
-  if (!sqe) {
-    LOG_ERROR("io_uring_get_sqe failed when submit provided write fd(%d)",
-              eventer->Fd());
-    return 0;
-  }
-  auto* op = AcquireOp(OpType::kWrite, eventer, ctx, eventer->Fd(), completion,
-                       context_deleter);
-  op->uses_provided_buffer = true;
-  op->provided_buf_count = static_cast<uint8_t>(count);
-  for (size_t i = 0; i < count; ++i) {
-    const uint16_t bid = buf_ids[i];
-    const size_t off = offsets[i];
-    const size_t len = lens[i];
-    op->provided_buf_ids[i] = bid;
-    op->provided_iovs[i].iov_base = static_cast<void*>(
-        buffers_.get() + (static_cast<size_t>(bid) * kBufSize) +
-        static_cast<size_t>(off));
-    op->provided_iovs[i].iov_len = len;
-  }
-  uint64_t token = EncodeOp(op);
-  ::io_uring_prep_writev(sqe, eventer->Fd(), op->provided_iovs.data(),
-                         static_cast<int>(count), 0);
-  ::io_uring_sqe_set_data64(sqe, token);
-  SubmitPending();
-  return token;
-#else
-  (void)eventer;
-  (void)buf_ids;
-  (void)offsets;
-  (void)lens;
-  (void)count;
-  (void)completion;
-  (void)ctx;
-  (void)key;
-  (void)context_deleter;
-  return 0;
-#endif
-}
-
 void Poller::HandleCqe(struct io_uring_cqe* cqe, const TimePoint& now,
                        EventerList* active_eventers) {
   uint64_t token = cqe->user_data;
@@ -646,7 +482,6 @@ void Poller::HandleCqe(struct io_uring_cqe* cqe, const TimePoint& now,
             reinterpret_cast<void*>(op->completion));
   bool keep_op = (cqe->flags & IORING_CQE_F_MORE) != 0;
   if (op->completion) {
-    op->skip_buf_release = false;
     if ((op->type == OpType::kRead || op->type == OpType::kWrite) &&
         op->eventer == nullptr) {
       CleanupOpContext(op);
@@ -659,9 +494,7 @@ void Poller::HandleCqe(struct io_uring_cqe* cqe, const TimePoint& now,
     }
     LOG_DEBUG("Call completion for type(%d)", static_cast<int>(op->type));
     op->completion(cqe, op);
-    if (!op->skip_buf_release) {
-      ReleaseBufferFromCqe(cqe);
-    }
+    ReleaseBufferFromCqe(cqe);
     if (!keep_op) {
       op->state.store(IoUringOp::State::kDone, std::memory_order_relaxed);
       RecycleOp(op);
@@ -721,11 +554,6 @@ void Poller::HandleCqe(struct io_uring_cqe* cqe, const TimePoint& now,
     case OpType::kTimeout:
     case OpType::kNone:
       break;
-  }
-  if (op->uses_provided_buffer && op->type == OpType::kWrite) {
-    for (size_t i = 0; i < op->provided_buf_count; ++i) {
-      ReturnBuffer(op->provided_buf_ids[i]);
-    }
   }
   op->state.store(IoUringOp::State::kDone, std::memory_order_relaxed);
   if (!keep_op) {
@@ -925,12 +753,6 @@ void Poller::ReturnBuffer(uint16_t bid) {
     LOG_WARN("buffer id out of range: %u", bid);
     return;
   }
-  if (leased_buffers_[bid]) {
-    leased_buffers_[bid] = 0;
-    if (leased_buffer_count_ > 0) {
-      --leased_buffer_count_;
-    }
-  }
   if (use_buf_ring_ && buf_ring_ != nullptr) {
     ::io_uring_buf_ring_add(
         buf_ring_, buffers_.get() + (static_cast<size_t>(bid) * kBufSize),
@@ -959,32 +781,6 @@ char* Poller::GetBuffer(uint16_t id) {
     return nullptr;
   }
   return buffers_.get() + (static_cast<size_t>(id) * kBufSize);
-}
-
-bool Poller::TryLeaseBuffer(uint16_t id) {
-#ifdef IORING_RECV_MULTISHOT
-  if (!buffers_registered_) {
-    return false;
-  }
-  if (id >= kBufCount) {
-    return false;
-  }
-  if (leased_buffer_limit_ == 0) {
-    return false;
-  }
-  if (leased_buffers_[id]) {
-    return false;
-  }
-  if (leased_buffer_count_ >= leased_buffer_limit_) {
-    return false;
-  }
-  leased_buffers_[id] = 1;
-  ++leased_buffer_count_;
-  return true;
-#else
-  (void)id;
-  return false;
-#endif
 }
 
 }  // namespace taotu

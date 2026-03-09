@@ -51,19 +51,6 @@ class Poller : NonCopyableMovable {
     CompletionFn completion{nullptr};
     ContextDeleter context_deleter{nullptr};
     std::atomic<State> state{State::kInit};
-
-    // Per-CQE flag: completion may set this to keep the provided recv buffer
-    // (IORING_CQE_F_BUFFER) until it is explicitly returned later.
-    bool skip_buf_release{false};
-
-    // For write ops that use Poller's provided buffers (see
-    // SubmitWriteProvidedBuffer). If the op gets canceled (completion cleared),
-    // Poller will return the buffer using this metadata.
-    static constexpr size_t kProvidedIovMax = 8;
-    bool uses_provided_buffer{false};
-    uint8_t provided_buf_count{0};
-    std::array<uint16_t, kProvidedIovMax> provided_buf_ids{};
-    std::array<struct iovec, kProvidedIovMax> provided_iovs{};
   };
 
   Poller();
@@ -89,17 +76,6 @@ class Poller : NonCopyableMovable {
                        CompletionFn completion = nullptr, void* ctx = nullptr,
                        uint64_t key = 0,
                        ContextDeleter context_deleter = nullptr);
-  uint64_t SubmitWriteProvidedBuffer(Eventer* eventer, uint16_t buf_id,
-                                     size_t offset, size_t len,
-                                     CompletionFn completion = nullptr,
-                                     void* ctx = nullptr, uint64_t key = 0,
-                                     ContextDeleter context_deleter = nullptr);
-  uint64_t SubmitWriteProvidedBuffers(Eventer* eventer, const uint16_t* buf_ids,
-                                      const size_t* offsets, const size_t* lens,
-                                      size_t count,
-                                      CompletionFn completion = nullptr,
-                                      void* ctx = nullptr, uint64_t key = 0,
-                                      ContextDeleter context_deleter = nullptr);
   uint64_t SubmitAccept(int fd, struct sockaddr* addr, socklen_t* addrlen,
                         void* ctx, CompletionFn completion = nullptr,
                         uint64_t key = 0, bool multishot = false,
@@ -119,15 +95,13 @@ class Poller : NonCopyableMovable {
   bool UseBufRing() const { return use_buf_ring_; }
   size_t BufferCount() const { return kBufCount; }
   // The buffer pointer is valid while Poller's provided-buffer pool is
-  // registered. For recv-multishot buffers, it must be returned via
-  // ReturnBuffer() when no longer needed (Poller auto-returns it unless
-  // completion sets IoUringOp::skip_buf_release=true).
+  // registered. For recv-multishot buffers, Poller returns them automatically
+  // after the read CQE is handled.
   char* GetBuffer(uint16_t id);
   void ReturnBuffer(uint16_t id);
-  bool TryLeaseBuffer(uint16_t id);
   static constexpr int kBufferGroupId = 1;
   static constexpr size_t kBufSize = 64 * 1024;
-  static constexpr size_t kBufCount = 256;
+  static constexpr size_t kBufCount = 1024;
 
  private:
   static uint64_t EncodeOp(IoUringOp* op);
@@ -159,9 +133,6 @@ class Poller : NonCopyableMovable {
   // Not value-initialized to avoid touching (zeroing) large memory on Poller
   // construction.
   std::unique_ptr<char[]> buffers_{};
-  std::array<uint8_t, kBufCount> leased_buffers_{};  // 0/1
-  size_t leased_buffer_count_{0};
-  size_t leased_buffer_limit_{0};
   std::vector<IoUringOp*> op_pool_;
   size_t op_pool_limit_{1U << 16};
   size_t submit_batch_{1};

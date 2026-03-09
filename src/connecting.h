@@ -49,12 +49,6 @@ class Connecting : NonCopyableMovable {
   typedef std::function<void(Connecting&)> NormalCallback;
   typedef std::function<void(Connecting&, IoBuffer*, TimePoint)>
       OnMessageCallback;
-  // For recv-multishot provided buffers. Return true to "consume/lease" the
-  // buffer (Poller will NOT auto-return it); the user must ensure the buffer is
-  // eventually returned (e.g., by calling SendBorrowed()).
-  typedef std::function<bool(Connecting&, const char* data, size_t len,
-                             uint16_t buf_id, TimePoint)>
-      OnBorrowedMessageCallback;
   typedef std::function<void(Connecting&, size_t)> HighWaterMarkCallback;
 
   Connecting(EventManager* event_manager, int socket_fd,
@@ -80,9 +74,6 @@ class Connecting : NonCopyableMovable {
   }
   void RegisterOnMessageCallback(const OnMessageCallback& cb) {
     OnMessageCallback_ = cb;
-  }
-  void RegisterOnBorrowedMessageCallback(const OnBorrowedMessageCallback& cb) {
-    OnBorrowedMessageCallback_ = cb;
   }
   void RegisterWriteCallback(const NormalCallback& cb) {
     WriteCompleteCallback_ = cb;
@@ -128,11 +119,6 @@ class Connecting : NonCopyableMovable {
   // Send the message (asynchronously at most time)
   void Send(IoBuffer* io_buffer);
 
-  // Send a Poller-provided recv buffer (buf_id from IORING_CQE_F_BUFFER)
-  // without copying into IoBuffer. Returns false if it can't be queued and
-  // caller should fallback to copying.
-  bool SendBorrowed(uint16_t buf_id, size_t len);
-
   // Shut down the writing end (close half == stop writing indeed)
   void ShutDownWrite();
 
@@ -174,16 +160,6 @@ class Connecting : NonCopyableMovable {
     struct iovec iov {};
     size_t to_send{0};
     uint64_t key{0};
-    bool borrowed{false};
-    size_t borrowed_iovcnt{0};
-    std::array<uint16_t, Poller::IoUringOp::kProvidedIovMax> borrowed_ids{};
-    std::array<size_t, Poller::IoUringOp::kProvidedIovMax> borrowed_lens{};
-  };
-
-  struct BorrowedChunk {
-    uint16_t buf_id{0};
-    uint32_t len{0};
-    uint32_t off{0};
   };
 
   void SubmitReadOnce();
@@ -229,7 +205,6 @@ class Connecting : NonCopyableMovable {
 
   // Callback function which will be called after each reading
   OnMessageCallback OnMessageCallback_;
-  OnBorrowedMessageCallback OnBorrowedMessageCallback_;
 
   // Callback function which will be called after each real writing
   NormalCallback WriteCompleteCallback_;
@@ -271,11 +246,6 @@ class Connecting : NonCopyableMovable {
   uint64_t write_cancel_key_{0};
   int pending_io_wait_ms_{0};
   int pending_io_retries_{0};
-
-  static constexpr size_t kBorrowedQueueCap = 8;
-  std::array<BorrowedChunk, kBorrowedQueueCap> borrowed_queue_{};
-  size_t borrowed_head_{0};
-  size_t borrowed_size_{0};
 
   // Context for any object bound
   std::any context_;

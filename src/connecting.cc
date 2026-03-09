@@ -133,24 +133,12 @@ void Connecting::OnReadComplete(struct io_uring_cqe* cqe,
   }
   if (res > 0) {
     bool rearmed = false;
-    bool consumed = false;
     // Update the input buffer.
     if (ctx->multishot && has_buffer) {
       auto* buf =
           connecting->event_manager_->GetPoller()->GetBuffer(ctx->buf_id);
       if (buf) {
-        if (connecting->OnBorrowedMessageCallback_) {
-          consumed = connecting->OnBorrowedMessageCallback_(
-              *connecting, buf, static_cast<size_t>(res), ctx->buf_id,
-              TimePoint{});
-          if (consumed) {
-            op->skip_buf_release = true;
-          } else {
-            connecting->input_buffer_.Append(buf, static_cast<size_t>(res));
-          }
-        } else {
-          connecting->input_buffer_.Append(buf, static_cast<size_t>(res));
-        }
+        connecting->input_buffer_.Append(buf, static_cast<size_t>(res));
       } else {
         LOG_WARN("buffer id out of range(%u)", ctx->buf_id);
       }
@@ -164,7 +152,7 @@ void Connecting::OnReadComplete(struct io_uring_cqe* cqe,
                                          static_cast<size_t>(res) - writable);
       }
     }
-    if (!consumed && connecting->OnMessageCallback_) {
+    if (connecting->OnMessageCallback_) {
       connecting->OnMessageCallback_(*connecting, &connecting->input_buffer_,
                                      TimePoint{});
     }
@@ -257,118 +245,6 @@ void Connecting::OnWriteComplete(struct io_uring_cqe* cqe,
   int err = res < 0 ? -res : 0;
   LOG_DEBUG("Write complete fd(%d) res(%zd) err(%d)", connecting->Fd(), res,
             err);
-  if (ctx->borrowed) {
-    // Borrowed fixed buffer write (may contain multiple iovecs).
-    auto* poller = connecting->event_manager_->GetPoller();
-    if (res > 0) {
-      size_t sent = static_cast<size_t>(res);
-      if (connecting->borrowed_size_ == 0) {
-        // Queue was cleared unexpectedly; return buffers best-effort.
-        for (size_t i = 0; i < ctx->borrowed_iovcnt; ++i) {
-          poller->ReturnBuffer(ctx->borrowed_ids[i]);
-        }
-      } else {
-        for (size_t i = 0;
-             i < ctx->borrowed_iovcnt && connecting->borrowed_size_ > 0; ++i) {
-          BorrowedChunk* chunk =
-              &connecting->borrowed_queue_[connecting->borrowed_head_];
-          const size_t seg_len = ctx->borrowed_lens[i];
-          if (sent >= seg_len) {
-            sent -= seg_len;
-            poller->ReturnBuffer(chunk->buf_id);
-            connecting->borrowed_head_ =
-                (connecting->borrowed_head_ + 1) % kBorrowedQueueCap;
-            --connecting->borrowed_size_;
-            continue;
-          }
-          // Partial within current buffer.
-          chunk->off += static_cast<uint32_t>(sent);
-          break;
-        }
-      }
-      // Prefer owned pending output (if any), then borrowed queue.
-      if (connecting->pending_output_buffer_.GetReadableBytes() > 0) {
-        connecting->output_buffer_.Swap(connecting->pending_output_buffer_);
-        connecting->SubmitWriteOnce();
-        connecting->CompletePendingIo();
-        if (connecting->write_ctx_ == ctx) {
-          connecting->write_ctx_ = nullptr;
-        }
-        return;
-      }
-      if (connecting->borrowed_size_ > 0) {
-        connecting->SubmitWriteOnce();
-        connecting->CompletePendingIo();
-        if (connecting->write_ctx_ == ctx) {
-          connecting->write_ctx_ = nullptr;
-        }
-        return;
-      }
-      if (connecting->WriteCompleteCallback_) {
-        connecting->WriteCompleteCallback_(*connecting);
-      }
-      if (Connecting::ConnectionState::kDisconnecting ==
-              connecting->state_.load() &&
-          connecting->output_buffer_.GetReadableBytes() == 0 &&
-          connecting->pending_output_buffer_.GetReadableBytes() == 0 &&
-          connecting->borrowed_size_ == 0) {
-        connecting->socketer_.ShutdownWrite();
-      }
-    } else {
-      if (err == EAGAIN || err == EWOULDBLOCK || err == EINTR) {
-        connecting->SubmitWriteOnce();
-        connecting->CompletePendingIo();
-        if (connecting->write_ctx_ == ctx) {
-          connecting->write_ctx_ = nullptr;
-        }
-        return;
-      }
-      // Fatal error: drop the borrowed buffers in this write attempt and
-      // continue.
-      if (connecting->borrowed_size_ == 0) {
-        for (size_t i = 0; i < ctx->borrowed_iovcnt; ++i) {
-          poller->ReturnBuffer(ctx->borrowed_ids[i]);
-        }
-      } else {
-        for (size_t i = 0;
-             i < ctx->borrowed_iovcnt && connecting->borrowed_size_ > 0; ++i) {
-          BorrowedChunk* chunk =
-              &connecting->borrowed_queue_[connecting->borrowed_head_];
-          poller->ReturnBuffer(chunk->buf_id);
-          connecting->borrowed_head_ =
-              (connecting->borrowed_head_ + 1) % kBorrowedQueueCap;
-          --connecting->borrowed_size_;
-        }
-      }
-      LOG_ERROR("OnWriteComplete(borrowed) error: fd(%d) res(%zd) err(%d)",
-                connecting->Fd(), res, err);
-      connecting->DoWithError(err);
-      if (connecting->pending_output_buffer_.GetReadableBytes() > 0) {
-        connecting->output_buffer_.Swap(connecting->pending_output_buffer_);
-        connecting->SubmitWriteOnce();
-        connecting->CompletePendingIo();
-        if (connecting->write_ctx_ == ctx) {
-          connecting->write_ctx_ = nullptr;
-        }
-        return;
-      }
-      if (connecting->borrowed_size_ > 0) {
-        connecting->SubmitWriteOnce();
-        connecting->CompletePendingIo();
-        if (connecting->write_ctx_ == ctx) {
-          connecting->write_ctx_ = nullptr;
-        }
-        return;
-      }
-    }
-    connecting->CompletePendingIo();
-    if (connecting->write_ctx_ == ctx) {
-      connecting->write_ctx_ = nullptr;
-    }
-    ctx->self = nullptr;
-    op->context = nullptr;
-    return;
-  }
   if (res > 0) {
     connecting->output_buffer_.Refresh(static_cast<size_t>(res));
     if (connecting->output_buffer_.GetReadableBytes() > 0) {
@@ -383,22 +259,13 @@ void Connecting::OnWriteComplete(struct io_uring_cqe* cqe,
         }
         return;
       }
-      if (connecting->borrowed_size_ > 0) {
-        connecting->SubmitWriteOnce();
-        connecting->CompletePendingIo();
-        if (connecting->write_ctx_ == ctx) {
-          connecting->write_ctx_ = nullptr;
-        }
-        return;
-      }
       if (connecting->WriteCompleteCallback_) {
         connecting->WriteCompleteCallback_(*connecting);
       }
       if (Connecting::ConnectionState::kDisconnecting ==
               connecting->state_.load() &&
           connecting->output_buffer_.GetReadableBytes() == 0 &&
-          connecting->pending_output_buffer_.GetReadableBytes() == 0 &&
-          connecting->borrowed_size_ == 0) {
+          connecting->pending_output_buffer_.GetReadableBytes() == 0) {
         connecting->socketer_.ShutdownWrite();
       }
     }
@@ -438,9 +305,9 @@ void Connecting::SubmitReadOnce() {
     ctx->writable = 0;
     ctx->extra_buffer = nullptr;
     ctx->extra_len = 0;
-    uint64_t key = poller->SubmitReadMultishot(&eventer_, Poller::kBufferGroupId,
-                                               &Connecting::OnReadComplete, ctx,
-                                               0, nullptr);
+    uint64_t key = poller->SubmitReadMultishot(
+        &eventer_, Poller::kBufferGroupId, &Connecting::OnReadComplete, ctx, 0,
+        nullptr);
     if (key == 0) {
       read_in_flight_ = false;
       read_cancel_key_ = 0;
@@ -478,9 +345,9 @@ void Connecting::SubmitReadOnce() {
   } else {
     iovcnt = (ctx->extra_len > 0 && ctx->writable < ctx->extra_len) ? 2 : 1;
   }
-  uint64_t key = poller->SubmitRead(&eventer_, ctx->iov.data(), iovcnt,
-                                    &Connecting::OnReadComplete, ctx, 0,
-                                    nullptr);
+  uint64_t key =
+      poller->SubmitRead(&eventer_, ctx->iov.data(), iovcnt,
+                         &Connecting::OnReadComplete, ctx, 0, nullptr);
   if (key == 0) {
     read_in_flight_ = false;
     read_cancel_key_ = 0;
@@ -504,77 +371,28 @@ void Connecting::SubmitWriteOnce() {
     return;
   }
   const size_t readable = output_buffer_.GetReadableBytes();
-  if (readable == 0 && borrowed_size_ == 0) {
+  if (readable == 0) {
     return;
   }
   auto* ctx = &write_ctx_storage_;
   ctx->self = this;
   write_ctx_ = ctx;
   ctx->key = 0;
-  ctx->borrowed = false;
-  ctx->borrowed_iovcnt = 0;
   auto* poller = event_manager_->GetPoller();
 
   // ctx->key = next_io_key_++; // Deprecated
   // write_cancel_key_ = ctx->key;
   write_in_flight_ = true;
-  uint64_t key = 0;
-  if (readable > 0) {
-    ctx->to_send = readable;
-    ctx->iov.iov_base = const_cast<char*>(output_buffer_.GetReadablePosition());
-    ctx->iov.iov_len = ctx->to_send;
-    key = poller->SubmitWrite(&eventer_, &ctx->iov, 1,
-                              &Connecting::OnWriteComplete, ctx, 0, nullptr);
-  } else {
-    ctx->borrowed = true;
-    const size_t iov_max = Poller::IoUringOp::kProvidedIovMax;
-    const size_t cnt = borrowed_size_ < iov_max ? borrowed_size_ : iov_max;
-    std::array<uint16_t, Poller::IoUringOp::kProvidedIovMax> ids{};
-    std::array<size_t, Poller::IoUringOp::kProvidedIovMax> offs{};
-    std::array<size_t, Poller::IoUringOp::kProvidedIovMax> lens{};
-    size_t total = 0;
-    for (size_t i = 0; i < cnt; ++i) {
-      const size_t idx = (borrowed_head_ + i) % kBorrowedQueueCap;
-      const BorrowedChunk& chunk = borrowed_queue_[idx];
-      ids[i] = chunk.buf_id;
-      offs[i] = static_cast<size_t>(chunk.off);
-      lens[i] = static_cast<size_t>(chunk.len - chunk.off);
-      ctx->borrowed_ids[i] = ids[i];
-      ctx->borrowed_lens[i] = lens[i];
-      total += lens[i];
-    }
-    ctx->borrowed_iovcnt = cnt;
-    ctx->to_send = total;
-    ctx->iov.iov_base = nullptr;
-    ctx->iov.iov_len = 0;
-    key = poller->SubmitWriteProvidedBuffers(
-        &eventer_, ids.data(), offs.data(), lens.data(), cnt,
-        &Connecting::OnWriteComplete, ctx, 0, nullptr);
-  }
+  ctx->to_send = readable;
+  ctx->iov.iov_base = const_cast<char*>(output_buffer_.GetReadablePosition());
+  ctx->iov.iov_len = ctx->to_send;
+  uint64_t key = poller->SubmitWrite(
+      &eventer_, &ctx->iov, 1, &Connecting::OnWriteComplete, ctx, 0, nullptr);
   if (key == 0) {
     write_in_flight_ = false;
     write_cancel_key_ = 0;
     if (write_ctx_ == ctx) {
       write_ctx_ = nullptr;
-    }
-    if (ctx->borrowed && borrowed_size_ > 0 && ctx->borrowed_iovcnt > 0) {
-      // Fallback: keep correctness by copying and returning the buffers.
-      for (size_t i = 0; i < ctx->borrowed_iovcnt && borrowed_size_ > 0; ++i) {
-        BorrowedChunk* chunk = &borrowed_queue_[borrowed_head_];
-        char* buf = poller->GetBuffer(chunk->buf_id);
-        if (buf && chunk->off < chunk->len) {
-          output_buffer_.Append(buf + chunk->off,
-                                static_cast<size_t>(chunk->len - chunk->off));
-        }
-        poller->ReturnBuffer(chunk->buf_id);
-        borrowed_head_ = (borrowed_head_ + 1) % kBorrowedQueueCap;
-        --borrowed_size_;
-      }
-      if (output_buffer_.GetReadableBytes() > 0 && !write_in_flight_) {
-        SubmitWriteOnce();
-        // SubmitWriteOnce reuses ctx; keep ctx->self for the new in-flight op.
-        return;
-      }
     }
     ctx->self = nullptr;
     return;
@@ -705,40 +523,6 @@ void Connecting::Send(IoBuffer* io_buffer) {
   SubmitWriteOnce();
 }
 
-bool Connecting::SendBorrowed(uint16_t buf_id, size_t len) {
-  if (len == 0) {
-    return false;
-  }
-  if (ConnectionState::kDisconnected == state_.load()) {
-    return false;
-  }
-  if (ConnectionState::kConnected != state_.load()) {
-    return false;
-  }
-  auto* poller = event_manager_->GetPoller();
-  if (!poller->BuffersRegistered()) {
-    return false;
-  }
-  if (poller->GetBuffer(buf_id) == nullptr) {
-    return false;
-  }
-  if (borrowed_size_ >= kBorrowedQueueCap) {
-    return false;
-  }
-  if (!poller->TryLeaseBuffer(buf_id)) {
-    return false;
-  }
-  const size_t tail = (borrowed_head_ + borrowed_size_) % kBorrowedQueueCap;
-  borrowed_queue_[tail].buf_id = buf_id;
-  borrowed_queue_[tail].len = static_cast<uint32_t>(len);
-  borrowed_queue_[tail].off = 0;
-  ++borrowed_size_;
-  if (!write_in_flight_) {
-    SubmitWriteOnce();
-  }
-  return true;
-}
-
 void Connecting::ShutDownWrite() {
   if (ConnectionState::kConnected == state_.load()) {
     SetState(ConnectionState::kDisconnecting);
@@ -767,15 +551,6 @@ void Connecting::ForceCloseAfter(int64_t delay_microseconds) {
 }
 
 void Connecting::CancelPendingIo() {
-  std::array<uint16_t, Poller::IoUringOp::kProvidedIovMax>
-      inflight_borrowed_ids{};
-  size_t inflight_borrowed_cnt = 0;
-  if (write_in_flight_ && write_ctx_ && write_ctx_->borrowed) {
-    inflight_borrowed_cnt = write_ctx_->borrowed_iovcnt;
-    for (size_t i = 0; i < inflight_borrowed_cnt; ++i) {
-      inflight_borrowed_ids[i] = write_ctx_->borrowed_ids[i];
-    }
-  }
   if (read_in_flight_) {
     if (read_cancel_key_ != 0) {
       (void)event_manager_->GetPoller()->CancelOp(read_cancel_key_);
@@ -799,25 +574,6 @@ void Connecting::CancelPendingIo() {
     }
     CompletePendingIo();
     write_in_flight_ = false;
-  }
-  if (borrowed_size_ > 0) {
-    auto* poller = event_manager_->GetPoller();
-    for (size_t i = 0; i < borrowed_size_; ++i) {
-      const size_t idx = (borrowed_head_ + i) % kBorrowedQueueCap;
-      bool skip = false;
-      for (size_t j = 0; j < inflight_borrowed_cnt; ++j) {
-        if (borrowed_queue_[idx].buf_id == inflight_borrowed_ids[j]) {
-          skip = true;
-          break;
-        }
-      }
-      if (skip) {
-        continue;
-      }
-      poller->ReturnBuffer(borrowed_queue_[idx].buf_id);
-    }
-    borrowed_head_ = 0;
-    borrowed_size_ = 0;
   }
 }
 

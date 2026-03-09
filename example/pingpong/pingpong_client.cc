@@ -159,17 +159,6 @@ void Session::Stop() { client_.StopWithoutQuit(); }
 void Session::OnConnectionCallback(taotu::Connecting& connection) {
   if (connection.IsConnected()) {
     connection.SetTcpNoDelay(true);
-    connection.RegisterOnBorrowedMessageCallback(
-        [this](taotu::Connecting& conn, const char*, size_t len,
-               uint16_t buf_id, taotu::TimePoint) {
-          if (!conn.SendBorrowed(buf_id, len)) {
-            return false;
-          }
-          messages_read_.fetch_add(1, std::memory_order_relaxed);
-          bytes_read_.fetch_add(static_cast<int64_t>(len),
-                                std::memory_order_relaxed);
-          return true;
-        });
     std::shared_ptr<PingpongClient> master_client(master_client_.lock());
     if (master_client) {
       const auto& message = master_client->GetMessage();

@@ -30,6 +30,19 @@ namespace {
 constexpr int kMaxRetryDelayMicroseconds = 30 * 1000 * 1000;
 constexpr int kInitRetryDelayMicroseconds = 500 * 1000;
 
+bool IsRetryableConnectError(int err) {
+  switch (err) {
+    case EAGAIN:
+    case EADDRINUSE:
+    case EADDRNOTAVAIL:
+    case ECONNREFUSED:
+    case ENETUNREACH:
+      return true;
+    default:
+      return false;
+  }
+}
+
 const char* StrError(int err, char* buf, size_t len) {
 #if defined(_GNU_SOURCE)
   char* msg = ::strerror_r(err, buf, len);
@@ -185,7 +198,7 @@ void Connector::DoConnecting(int conn_fd) {
   eventer_->EnableWriteEvents();
 }
 void Connector::DoRetrying(int conn_fd) {
-  LOG_WARN("Connector fd(%d) is closing for retrying!", conn_fd);
+  LOG_DEBUG("Connector fd(%d) is closing for retrying!", conn_fd);
   ::close(conn_fd);
   SetState(ConnectState::kDisconnected);
   if (can_connect_) {
@@ -214,10 +227,12 @@ void Connector::DoWriting() {
     int conn_fd = RemoveAndReset();
     int error = GetSocketError(conn_fd);
     if (error) {
-      char errno_info[512];
-      const char* err_str = StrError(error, errno_info, sizeof(errno_info));
-      LOG_WARN("Connector fd(%d) has the error(%s)!", conn_fd,
-               err_str ? err_str : errno_info);
+      if (!IsRetryableConnectError(error)) {
+        char errno_info[512];
+        const char* err_str = StrError(error, errno_info, sizeof(errno_info));
+        LOG_WARN("Connector fd(%d) has the error(%s)!", conn_fd,
+                 err_str ? err_str : errno_info);
+      }
       DoRetrying(conn_fd);
     } else if ([](int conn_fd) -> bool {
                  struct sockaddr_in6 local_address =
@@ -256,17 +271,22 @@ void Connector::DoWithError() {
   if (!eventer_) {
     return;
   }
-  LOG_ERROR("Connector fd(%d) has the error with the state(%d).",
-            eventer_->Fd(), state_);
   if (ConnectState::kConnecting == state_) {
     int conn_fd = RemoveAndReset();
     int error = GetSocketError(conn_fd);
-    char errno_info[512];
-    const char* err_str = StrError(error, errno_info, sizeof(errno_info));
-    LOG_WARN("Connector fd(%d) has the error(%s)!", conn_fd,
-             err_str ? err_str : errno_info);
+    if (!IsRetryableConnectError(error)) {
+      char errno_info[512];
+      const char* err_str = StrError(error, errno_info, sizeof(errno_info));
+      LOG_ERROR("Connector fd(%d) has the error with the state(%d).", conn_fd,
+                state_);
+      LOG_WARN("Connector fd(%d) has the error(%s)!", conn_fd,
+               err_str ? err_str : errno_info);
+    }
     DoRetrying(conn_fd);
+    return;
   }
+  LOG_ERROR("Connector fd(%d) has the error with the state(%d).",
+            eventer_->Fd(), state_);
 }
 int Connector::RemoveAndReset() {
   if (!eventer_) {
